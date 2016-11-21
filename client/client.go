@@ -1069,17 +1069,23 @@ func (c *Client) updateNodeStatus() error {
 
 // updateAllocStatus is used to update the status of an allocation
 func (c *Client) updateAllocStatus(alloc *structs.Allocation) {
-	// Only send the fields that are updatable by the client.
+	select {
+	case c.allocUpdates <- alloc:
+	case <-c.shutdownCh:
+	}
+}
+
+// stripAllocation strips the allocation of fields which can be re-assembled in
+// the server.
+func (c *Client) stripAllocation(alloc *structs.Allocation) *structs.Allocation {
 	stripped := new(structs.Allocation)
 	stripped.ID = alloc.ID
 	stripped.NodeID = c.Node().ID
 	stripped.TaskStates = alloc.TaskStates
 	stripped.ClientStatus = alloc.ClientStatus
 	stripped.ClientDescription = alloc.ClientDescription
-	select {
-	case c.allocUpdates <- stripped:
-	case <-c.shutdownCh:
-	}
+
+	return stripped
 }
 
 // allocSync is a long lived function that batches allocation updates to the
@@ -1103,7 +1109,10 @@ func (c *Client) allocSync() {
 			if blockedAlloc, ok := c.blockedAllocations[alloc.ID]; ok && alloc.Terminated() {
 				var prevAllocDir *allocdir.AllocDir
 				if ar, ok := c.getAllocRunners()[alloc.ID]; ok {
-					prevAllocDir = ar.GetAllocDir()
+					tg := alloc.Job.LookupTaskGroup(alloc.TaskGroup)
+					if tg != nil && tg.EphemeralDisk.Sticky {
+						prevAllocDir = ar.GetAllocDir()
+					}
 				}
 				if err := c.addAlloc(blockedAlloc, prevAllocDir); err != nil {
 					c.logger.Printf("[ERR] client: failed to add alloc which was previously blocked %q: %v",
@@ -1120,7 +1129,9 @@ func (c *Client) allocSync() {
 
 			sync := make([]*structs.Allocation, 0, len(updates))
 			for _, alloc := range updates {
-				sync = append(sync, alloc)
+				// Only send the fields that are updatable by the client.
+				stripped := c.stripAllocation(alloc)
+				sync = append(sync, stripped)
 			}
 
 			// Send to server.
@@ -1393,7 +1404,7 @@ func (c *Client) runAllocs(update *allocUpdates) {
 		// previous allocation
 		var prevAllocDir *allocdir.AllocDir
 		tg := add.Job.LookupTaskGroup(add.TaskGroup)
-		if tg != nil && tg.EphemeralDisk != nil && tg.EphemeralDisk.Sticky == true && ar != nil {
+		if tg != nil && tg.EphemeralDisk != nil && tg.EphemeralDisk.Sticky && ar != nil {
 			prevAllocDir = ar.GetAllocDir()
 		}
 
